@@ -1,4 +1,5 @@
 import argparse
+import lief
 from abc import ABC, abstractmethod
 from capstone import *
 from syscalls import *
@@ -58,21 +59,51 @@ class Amd64Attacher(SandboxAttacher):
             self.fr = None
             self.to = None
             self.asm = ""
-
+        self.filename = self.argv.file
         self.rulesNum = len(self.argv.disable_syscalls)
         self.arch = arch
         self.initializeBinary()
     
     #初始化二进制文件
     def initializeBinary(self):
-        self.binary = self.argv.file
-        self.patcher = AwdPwnPatcher(self.binary)
-        self.elf = ELF(self.binary)
+        self.patcher = AwdPwnPatcher(self.filename)
+        self.elf = ELF(self.filename)
 
     def showDisabled(self):
         success(f'disabled syscall:{", ".join(self.argv.disable_syscalls)}')
 
-    
+    def makeSectionExecutable(self):
+        binary = lief.parse(self.filename+'_patch')
+        # 查找 .eh_frame 段,改段表
+        eh_frame = None
+        
+        for section in binary.sections:
+            print(section.name)
+            if section.name == ".eh_frame":
+                eh_frame = section
+                break
+        if eh_frame:
+            # 打印原始段标志
+            show(f"Original section flags: {eh_frame.flags}")
+            # 设置新标志：RWX（可读、可写、可执行）
+            eh_frame.flags = (lief.ELF.Section.FLAGS.ALLOC |  # ALLOC
+                  lief.ELF.Section.FLAGS.EXECINSTR |  # EXECINSTR (Executable instructions)
+                  lief.ELF.Section.FLAGS.WRITE)   # WRITE
+            # 打印修改后的段标志
+            show(f"Modified section flags: {eh_frame.flags}")
+            # 保存修改后的二进制文件
+        else:
+            error(".eh_frame section not found")
+        # 查找包含 eh_frame 段的 Program Header
+        for ph in binary.segments:
+            if ph.virtual_address <= binary.get_section('.eh_frame').virtual_address < (ph.virtual_address + ph.virtual_size):
+                # 给 Program Header 增加可执行权限
+                ph.add(lief.ELF.Segment.FLAGS.X)  # X 代表可执行
+                break
+        else:
+            error(".eh_frame section not found")
+        binary.write(self.filename+'_patch')
+
     #无需用户指定开始patch by jmp的位置，自动识别
     def automaticStart(self):
         mainAddr = self.elf.symbols['main']
@@ -85,15 +116,17 @@ class Amd64Attacher(SandboxAttacher):
         # 反汇编指令存储列表
         instructions = []
         byte_count = 0
+        additional = 0  #处理额外的情况
         for i in md.disasm(code, mainAddr):
-            if i.mnemonic == 'endbr64':
+            if i.mnemonic == 'endbr64':     #不替换endbr64
+                additional = i.size
                 continue
             print(f"0x{i.address:x}:\t{i.mnemonic}\t{i.op_str}")
             byte_count += i.size
             instructions.append(i.mnemonic + ' ' + i.op_str)
             # 只要找到的指令总长度达到或超过 5 字节就停止
             if byte_count >= 5:
-                self.to = mainAddr + byte_count
+                self.to = mainAddr + byte_count + additional
                 break
         #将instruction中的内容拼接到asm中去
         self.asm = "\n".join(instructions)
@@ -112,6 +145,7 @@ class Amd64Attacher(SandboxAttacher):
         print(assembly)
         self.patcher.patch_by_jmp(jmp_from=self.fr,jmp_to=self.to,assembly=assembly)
         self.patcher.save()
+        self.makeSectionExecutable()        #赋予ehframe段可执行权限
         
     def setProg(self,filter_addr):
         prog = p64(3+len(self.argv.disable_syscalls)) + p64(filter_addr)
@@ -139,15 +173,6 @@ def findInvalid(args,arch):
             if arg not in Amd64syscalls:
                 invalid.append(arg)
     return invalid
-
-def helpInfo():
-    print('''-h --help :  shows instructions\n
-          -f --file :   choose the target binary\n
-          -d --disable-syscalls :   choose the syscall you want to ban\n
-          -a --asm :    your skipped opcode\n
-          --fr :    where your patch start\n
-          --to :    where you back to main process\n
-          ''')
 
 
 if __name__ == '__main__':

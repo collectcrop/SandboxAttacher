@@ -9,4 +9,4 @@ def warn(msg):
     print(f"\033[33m[*] {msg}\033[0m")
 
 def error(msg):
-    print(f"\033[31m[*] {msg}\033[0m")
+    print(f"\033[31m[-] {msg}\033[0m")
