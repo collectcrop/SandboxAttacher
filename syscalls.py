@@ -1,5 +1,5 @@
 
-syscalls = [
+Amd64syscalls = [
     'read', 'write', 'open', 'close', 'stat', 'fstat', 'lstat', 'poll', 'lseek', 'mmap',
     'mprotect', 'munmap', 'brk', 'rt_sigaction', 'rt_sigprocmask', 'rt_sigreturn', 'ioctl', 'pread64', 'pwrite64',
     'readv', 'writev', 'access', 'pipe', 'select', 'sched_yield', 'mremap', 'msync', 'mincore',
@@ -46,8 +46,10 @@ syscalls = [
 ]
 
 
-def getSysNum(syscall):
+def getSysNum(syscall,arch):
     try:
-        return syscalls.index(syscall)
+        if arch == 'amd64':
+            return Amd64syscalls.index(syscall)
+        
     except ValueError:
         raise ValueError(f"Invalid syscall: {syscall}")

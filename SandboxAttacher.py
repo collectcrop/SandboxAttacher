@@ -1,66 +1,143 @@
 import argparse
-import logging
+from abc import ABC, abstractmethod
+from capstone import *
 from syscalls import *
 from AwdPwnPatcher import *
+from info import *
 from pwn import *
 
-logging.basicConfig(level=logging.INFO)
 DEBUG = True
-
-class SandboxAttacher:
-    def __init__(self,argv) -> None:
+#amd64模板
+Assembly = """      
+mov rax,157
+mov rdi,22
+mov rsi,2
+lea rdx,[{0}]
+syscall
+{1}
+"""
+class SandboxAttacher(ABC):      #父类
+    def __init__(self,argv,arch) -> None:
         self.argv = argv        #参数列表
-        self.fr = int(argv.fr,16)            #开始跳转进行patch的地址
-        self.to = int(argv.to,16)           #最后跳转回的地址
-        self.asm = argv.asm          #覆盖掉的指令
+        if not (argv.to is None or argv.fr is None or argv.asm is None):
+            self.fr = int(argv.fr,16)            #开始跳转进行patch的地址
+            self.to = int(argv.to,16)           #最后跳转回的地址
+            self.asm = argv.asm          #覆盖掉的指令
+        else:
+            self.fr = None
+            self.to = None
+            self.asm = ""
+        
         self.rulesNum = len(self.argv.disable_syscalls)
+        self.arch = arch
     
+    @abstractmethod
     def showDisabled(self):
-        logging.info(f'[+] disabled syscall:{", ".join(self.argv.disable_syscalls)}')
+        success(f'disabled syscall:{", ".join(self.argv.disable_syscalls)}')
+    
+    @abstractmethod
+    def initializeBinary(self):
+        pass
 
+    def automaticStart(self):   #无需用户指定开始patch by jmp的位置，自动识别
+        pass
+
+    @abstractmethod
+    def disable(self):
+        """禁用某些系统调用，主要逻辑所在"""
+        pass
+
+class Amd64Attacher(SandboxAttacher):
+    def __init__(self,argv,arch) -> None:
+        self.argv = argv        #参数列表
+        if not (argv.to is None or argv.fr is None or argv.asm is None):
+            self.fr = int(argv.fr,16)            #开始跳转进行patch的地址
+            self.to = int(argv.to,16)           #最后跳转回的地址
+            self.asm = argv.asm          #覆盖掉的指令
+        else:
+            self.fr = None
+            self.to = None
+            self.asm = ""
+
+        self.rulesNum = len(self.argv.disable_syscalls)
+        self.arch = arch
+        self.initializeBinary()
+    
+    #初始化二进制文件
+    def initializeBinary(self):
+        self.binary = self.argv.file
+        self.patcher = AwdPwnPatcher(self.binary)
+        self.elf = ELF(self.binary)
+
+    def showDisabled(self):
+        success(f'disabled syscall:{", ".join(self.argv.disable_syscalls)}')
+
+    
+    #无需用户指定开始patch by jmp的位置，自动识别
+    def automaticStart(self):
+        mainAddr = self.elf.symbols['main']
+        self.fr = mainAddr
+        show(f"Main addr: {hex(mainAddr)}")
+        code = self.elf.read(mainAddr, 20)  #先读20字节机器码
+        # 使用 Capstone 反汇编机器码
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        # 找出5字节空间用于跳转
+        # 反汇编指令存储列表
+        instructions = []
+        byte_count = 0
+        for i in md.disasm(code, mainAddr):
+            if i.mnemonic == 'endbr64':
+                continue
+            print(f"0x{i.address:x}:\t{i.mnemonic}\t{i.op_str}")
+            byte_count += i.size
+            instructions.append(i.mnemonic + ' ' + i.op_str)
+            # 只要找到的指令总长度达到或超过 5 字节就停止
+            if byte_count >= 5:
+                self.to = mainAddr + byte_count
+                break
+        #将instruction中的内容拼接到asm中去
+        self.asm = "\n".join(instructions)
+        show("automatic replace: "+self.asm.replace('\n',';'))
+    
     #禁用syscall
     def disable(self):
-        binary = self.argv.file
-        patcher = AwdPwnPatcher(binary)
-        filter_addr = self.setFilters(patcher)
-        prog_addr = self.setProg(patcher,filter_addr)
-
-        assembly = f"""
-            mov rax,157
-            mov rdi,22
-            mov rsi,2
-            lea rdx,[{prog_addr}]
-            syscall
-            {self.asm}
-            """
-        print(assembly)
-        patcher.patch_by_jmp(jmp_from=self.fr,jmp_to=self.to,assembly=assembly)
-        patcher.save()
+        #未提供相应参数，自动识别
+        if self.to is None or self.fr is None or self.asm is None:
+            self.automaticStart()
         
-    def setProg(self,patcher,filter_addr):
+        filter_addr = self.setFilters()
+        prog_addr = self.setProg(filter_addr)
+
+        assembly = Assembly.format(prog_addr,self.asm)
+        print(assembly)
+        self.patcher.patch_by_jmp(jmp_from=self.fr,jmp_to=self.to,assembly=assembly)
+        self.patcher.save()
+        
+    def setProg(self,filter_addr):
         prog = p64(3+len(self.argv.disable_syscalls)) + p64(filter_addr)
-        prog_addr = patcher.add_constant_in_ehframe(prog)
+        prog_addr = self.patcher.add_constant_in_ehframe(prog)
         return prog_addr
     
-    def setFilters(self,patcher):
+    def setFilters(self):
         filter = p64(0x20)
         for i,syscall in enumerate(self.argv.disable_syscalls):
             item = 0x15     #记录该条syscall的BPF_JUMP规则
-            jt,jf = self.rulesNum-1-i,self.rulesNum-i       #记录匹配到和未匹配到调用号所需跳转的长度
+            jt,jf = self.rulesNum-1-i, 1 if(i==self.rulesNum-1) else 0  #记录匹配到和未匹配到调用号所需跳转的长度,最后一条记录未匹配跳转到pass
             item += (jt << 16) + (jf << 24)
-            item += getSysNum(syscall) << 32
+            item += getSysNum(syscall,self.arch) << 32
             print(hex(item))
             filter += p64(item)
         filter += p64(6) + p64(0x7fff000000000006)
-        filter_addr = patcher.add_constant_in_ehframe(filter)
+        filter_addr = self.patcher.add_constant_in_ehframe(filter)
         return filter_addr
 
 
-def findInvalid(args):
+def findInvalid(args,arch):
     invalid = []
-    for arg in args:
-        if arg not in syscalls:
-            invalid.append(arg)
+    if arch == 'amd64':
+        for arg in args:
+            if arg not in Amd64syscalls:
+                invalid.append(arg)
     return invalid
 
 def helpInfo():
@@ -72,7 +149,9 @@ def helpInfo():
           --to :    where you back to main process\n
           ''')
 
+
 if __name__ == '__main__':
+    ARCH = 'amd64'      #默认架构
     parser = argparse.ArgumentParser(description="SandboxAttacher")
     #获取禁用禁用的syscall
     parser.add_argument('-d','--disable-syscalls', 
@@ -89,30 +168,40 @@ if __name__ == '__main__':
     #patch起始地址
     parser.add_argument('--fr', 
         help='开始patch的起始地址',
-        required=True  # 设置为必填参数
+        required=False
         )
     
     #patch跳转回地址
     parser.add_argument('--to', 
         help='跳转回地址',
-        required=True  # 设置为必填参数
+        required=False
         )
 
     #补全跳过的命令
-    parser.add_argument('-a','--asm', 
+    parser.add_argument('--asm', 
         help='补全指令',
-        required=False  # 设置为必填参数
+        required=False
+        )
+    
+    #指定架构
+    parser.add_argument('-a','--arch', 
+        help='指定程序架构:[i386,amd64...]',
+        required=False  # 默认为amd64
         )
     
     # 解析命令行参数
     args = parser.parse_args()
 
+    if args.arch:
+        ARCH = args.arch
+
     # 检查给出的系统调用的正确性
-    invalid = findInvalid(args.disable_syscalls)
+    invalid = findInvalid(args.disable_syscalls,ARCH)
     if len(invalid)!=0:
         print(f'Invalid syscall: {", ".join(invalid)}')
     else:
-        attacher = SandboxAttacher(args)
+        attacher = Amd64Attacher(args,ARCH)
         attacher.showDisabled()
         attacher.disable()
-        print('[+] done!')
+        success('done!')
+        
